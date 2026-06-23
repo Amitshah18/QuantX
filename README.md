@@ -76,3 +76,4 @@ My roadmap for QuantX includes:
 *   [LinkedIn](#)
 *   [Twitter / X](#)
 *   [Email](mailto:team@quantx.fi)
+
