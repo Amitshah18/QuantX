@@ -1,18 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState, useEffect } from "react";
 import Link from "next/link";
-import { format } from "date-fns";
-import {
-  MoreHorizontal,
-  Plus,
-  Play,
-  Pause,
-  Trash2,
-  Loader2,
-} from "lucide-react";
-
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import {
   Table,
   TableBody,
@@ -21,292 +13,378 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import Navbar from "@/components/Navbar";
+import { useWallet } from "@/context/WalletContext";
+import api from "@/lib/api";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { useWallet } from "@/context/wallet-provider";
+  createSorobanServer,
+  createContract,
+  getNetworks,
+  getBaseFee,
+  createTransactionBuilder,
+  parseTransactionFromXDR,
+} from "@/lib/stellar";
+import { signTransaction } from "@stellar/freighter-api";
 
-// --- Types & Mock Data (Replace with real contract calls) ---
-type SubscriptionStatus = "Active" | "Paused" | "Cancelled";
+const CONTRACT_ID = process.env.NEXT_PUBLIC_CONTRACT_ID || "";
+const RPC_URL =
+  process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org";
+const NETWORK = process.env.NEXT_PUBLIC_NETWORK || "TESTNET";
+const DEV_MODE = process.env.NEXT_PUBLIC_DEV_MODE === "true";
 
-interface Subscription {
-  id: string;
+const STATUS_LABELS: { [key: number]: { label: string; className: string } } = {
+  0: { label: "Active", className: "bg-green-500" },
+  1: { label: "Paused", className: "bg-yellow-500" },
+  2: { label: "Failed", className: "bg-red-500" },
+  3: { label: "Cancelled", className: "bg-gray-500" },
+};
+
+interface Payment {
+  id: number;
   recipient: string;
-  token: string;
   amount: number;
-  interval: string; // e.g., "Monthly"
-  nextExecution: number; // Unix timestamp
-  status: SubscriptionStatus;
+  interval: number;
+  next_execution: number;
+  status: number;
+  created_at: number;
+  token?: string;
 }
 
-// Mock fetching function
-const fetchSubscriptions = async (address: string): Promise<Subscription[]> => {
-  await new Promise((r) => setTimeout(r, 1000));
-  // Return empty array [] to test empty state
-  return [
-    {
-      id: "1",
-      recipient: "GABC...1234",
-      token: "USDC",
-      amount: 50.0,
-      interval: "Monthly",
-      nextExecution: Math.floor(Date.now() / 1000) + 86400 * 5,
-      status: "Active",
-    },
-    {
-      id: "2",
-      recipient: "GXYZ...9876",
-      token: "XLM",
-      amount: 100.0,
-      interval: "Weekly",
-      nextExecution: Math.floor(Date.now() / 1000) + 86400 * 2,
-      status: "Paused",
-    },
-    {
-      id: "3",
-      recipient: "GDEF...5678",
-      token: "USDC",
-      amount: 10.0,
-      interval: "Daily",
-      nextExecution: Math.floor(Date.now() / 1000) - 86400, // Past
-      status: "Cancelled",
-    },
-  ];
-};
-
-// --- Action Handlers (Mock) ---
-const handlePause = async (id: string) => {
-  console.log(`Pausing ${id}...`);
-  // await contract.pause(id);
-};
-const handleResume = async (id: string) => {
-  console.log(`Resuming ${id}...`);
-  // await contract.resume(id);
-};
-const handleCancel = async (id: string) => {
-  console.log(`Cancelling ${id}...`);
-  // await contract.cancel(id);
-};
-
-export default function DashboardPage() {
-  const { address, isConnected } = useWallet();
-  const [data, setData] = useState<Subscription[]>([]);
+export default function Dashboard() {
+  const { walletConnected, publicKey } = useWallet();
+  const [payments, setPayments] = useState<Payment[]>([]);
   const [loading, setLoading] = useState(true);
+  const [actionLoading, setActionLoading] = useState<number | null>(null);
 
   useEffect(() => {
-    if (isConnected && address) {
-      setLoading(true);
-      fetchSubscriptions(address)
-        .then(setData)
-        .finally(() => setLoading(false));
+    if (walletConnected && publicKey) {
+      loadPayments();
+      const interval = setInterval(loadPayments, 10000); // Refresh every 10 seconds
+      return () => clearInterval(interval);
     } else {
       setLoading(false);
     }
-  }, [isConnected, address]);
+  }, [walletConnected, publicKey]);
 
-  if (!isConnected) {
+  const loadPayments = async () => {
+    if (!publicKey) return;
+
+    try {
+      // Development mode - use mock data
+      if (DEV_MODE) {
+        console.log("DEV MODE: Using mock payment data");
+
+        const mockPayments: Payment[] = [
+          {
+            id: 1,
+            recipient: "GCUOCLOPD3I7ECINEXFOJVGFGFNJILYYW26BERBCCQBG7WHJMICHR2WPM",
+            amount: 100 * 10000000,
+            interval: 3600,
+            next_execution: Math.floor(Date.now() / 1000) + 1800,
+            status: 0,
+            created_at: Math.floor(Date.now() / 1000) - 86400,
+            token: "USDC",
+          },
+          {
+            id: 2,
+            recipient: "GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            amount: 50 * 10000000,
+            interval: 86400,
+            next_execution: Math.floor(Date.now() / 1000) + 43200,
+            status: 0,
+            created_at: Math.floor(Date.now() / 1000) - 172800,
+            token: "XLM",
+          },
+        ];
+
+        setPayments(mockPayments);
+        setLoading(false);
+        return;
+      }
+
+      // Production mode - fetch from backend API
+      try {
+        const response = await api.getPaymentsByUser(publicKey);
+        if (response.success && response.payments) {
+          setPayments(response.payments);
+        }
+      } catch (apiError) {
+        console.error("API Error:", apiError);
+        // Fallback to empty array
+        setPayments([]);
+      }
+    } catch (error) {
+      console.error("Error loading payments:", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const executeAction = async (
+    paymentId: number,
+    action: string,
+    loadingText: string
+  ) => {
+    if (!publicKey) {
+      alert("Please connect your wallet");
+      return;
+    }
+
+    setActionLoading(paymentId);
+
+    try {
+      if (DEV_MODE) {
+        console.log(`DEV MODE: Simulating ${action} for payment ${paymentId}`);
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        // Reload payments after action
+        setTimeout(loadPayments, 500);
+        setActionLoading(null);
+        return;
+      }
+
+      const server = await createSorobanServer(RPC_URL);
+      const contract = await createContract(CONTRACT_ID);
+      const Networks = await getNetworks();
+      const BASE_FEE = await getBaseFee();
+
+      const account = await server.getAccount(publicKey);
+
+      const builder = await createTransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase:
+          Networks[NETWORK as keyof typeof Networks] || Networks.TESTNET,
+      });
+
+      const transaction = builder
+        .addOperation(contract.call(action, paymentId))
+        .setTimeout(30)
+        .build();
+
+      const xdr = transaction.toXDR();
+      const signedXdr = await signTransaction(xdr, {
+        networkPassphrase:
+          Networks[NETWORK as keyof typeof Networks] || Networks.TESTNET,
+      });
+
+      if (signedXdr.error) {
+        throw new Error(signedXdr.error);
+      }
+
+      const signedTx = await parseTransactionFromXDR(
+        typeof signedXdr === "string" ? signedXdr : signedXdr.signedTxXdr,
+        Networks[NETWORK as keyof typeof Networks] || Networks.TESTNET
+      );
+      await server.sendTransaction(signedTx);
+
+      // Reload payments after action
+      setTimeout(loadPayments, 2000);
+    } catch (error: any) {
+      console.error(`Error executing ${action}:`, error);
+      alert(`Failed to ${action.replace("_", " ")}: ${error.message}`);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handlePause = async (paymentId: number) => {
+    await executeAction(paymentId, "pause_payment", "Pausing...");
+  };
+
+  const handleResume = async (paymentId: number) => {
+    await executeAction(paymentId, "resume_payment", "Resuming...");
+  };
+
+  const handleCancel = async (paymentId: number) => {
+    if (!confirm("Are you sure you want to cancel this payment?")) {
+      return;
+    }
+    await executeAction(paymentId, "cancel_payment", "Cancelling...");
+  };
+
+  const formatTime = (timestamp: number) => {
+    const date = new Date(timestamp * 1000);
+    return date.toLocaleString();
+  };
+
+  const formatInterval = (seconds: number) => {
+    if (seconds < 3600) {
+      return `${Math.floor(seconds / 60)} minutes`;
+    } else if (seconds < 86400) {
+      return `${Math.floor(seconds / 3600)} hours`;
+    } else {
+      return `${Math.floor(seconds / 86400)} days`;
+    }
+  };
+
+  if (!walletConnected) {
     return (
-      <div className="flex h-[400px] items-center justify-center rounded-lg border border-dashed border-slate-300 bg-slate-50">
-        <div className="text-center">
-          <h3 className="mt-2 text-sm font-semibold text-slate-900">
-            Wallet not connected
-          </h3>
-          <p className="mt-1 text-sm text-slate-500">
-            Please connect your wallet to view subscriptions.
-          </p>
-        </div>
+      <div className="min-h-screen bg-slate-50">
+        <Navbar />
+        <main className="container mx-auto py-10 px-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Connect Wallet Required</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p>Please connect your Freighter wallet to view your payments.</p>
+            </CardContent>
+          </Card>
+        </main>
+      </div>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50">
+        <Navbar />
+        <main className="container mx-auto py-10 px-4">
+          <Card>
+            <CardContent className="py-10">
+              <div className="text-center">Loading payments...</div>
+            </CardContent>
+          </Card>
+        </main>
       </div>
     );
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight text-slate-900">
-            Subscriptions
-          </h2>
-          <p className="text-sm text-slate-500">
-            Manage your recurring crypto payments.
-          </p>
-        </div>
-        <Button asChild className="bg-indigo-600 hover:bg-indigo-700">
-          <Link href="/dashboard/create">
-            <Plus className="mr-2 h-4 w-4" /> Create New
+    <div className="min-h-screen bg-slate-50">
+      <Navbar />
+      <main className="container mx-auto py-10 px-4">
+        <div className="flex justify-between items-center mb-6">
+          <h1 className="text-3xl font-bold">Your Recurring Payments</h1>
+          <Link href="/create">
+            <Button>+ New Payment</Button>
           </Link>
-        </Button>
-      </div>
+        </div>
 
-      <Card className="border-slate-200 shadow-sm">
-        <CardHeader className="p-6 pb-2">
-          {/* Optional header content if needed */}
-        </CardHeader>
-        <CardContent className="p-0">
-          {loading ? (
-            <div className="flex h-[300px] items-center justify-center">
-              <Loader2 className="h-8 w-8 animate-spin text-indigo-600" />
-            </div>
-          ) : data.length === 0 ? (
-            // --- Empty State ---
-            <div className="flex flex-col items-center justify-center py-16 text-center">
-              <div className="bg-slate-100 p-4 rounded-full mb-4">
-                <Plus className="h-8 w-8 text-slate-400" />
+        {payments.length === 0 ? (
+          <Card>
+            <CardContent className="py-10">
+              <div className="text-center">
+                <h3 className="text-xl font-semibold mb-2">
+                  No Recurring Payments
+                </h3>
+                <p className="text-gray-500 mb-4">
+                  Create your first recurring payment to get started
+                </p>
+                <Link href="/create">
+                  <Button>Create Payment</Button>
+                </Link>
               </div>
-              <h3 className="text-lg font-medium text-slate-900">
-                No subscriptions found
-              </h3>
-              <p className="text-sm text-slate-500 mt-1 max-w-sm">
-                You haven't set up any recurring payments yet. Create one to get
-                started.
-              </p>
-              <Button asChild variant="outline" className="mt-6">
-                <Link href="/dashboard/create">Create Subscription</Link>
-              </Button>
-            </div>
-          ) : (
-            // --- Data Table ---
-            <Table>
-              <TableHeader className="bg-slate-50">
-                <TableRow>
-                  <TableHead className="w-[100px]">Status</TableHead>
-                  <TableHead>Recipient / ID</TableHead>
-                  <TableHead>Amount</TableHead>
-                  <TableHead>Interval</TableHead>
-                  <TableHead>Next Execution</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.map((sub) => (
-                  <TableRow key={sub.id} className="hover:bg-slate-50/50">
-                    {/* Status Badge */}
-                    <TableCell>
-                      <StatusBadge status={sub.status} />
-                    </TableCell>
-
-                    {/* ID & Recipient */}
-                    <TableCell>
-                      <div className="flex flex-col">
-                        <span className="font-medium text-slate-900">
-                          #{sub.id}
-                        </span>
-                        <span className="text-xs text-slate-500 font-mono truncate max-w-[120px]">
-                          {sub.recipient}
-                        </span>
-                      </div>
-                    </TableCell>
-
-                    {/* Amount */}
-                    <TableCell className="font-medium text-slate-900">
-                      {sub.amount}{" "}
-                      <span className="text-slate-500 text-xs">
-                        {sub.token}
-                      </span>
-                    </TableCell>
-
-                    {/* Interval */}
-                    <TableCell className="text-slate-600">
-                      {sub.interval}
-                    </TableCell>
-
-                    {/* Next Execution Date */}
-                    <TableCell className="text-slate-600">
-                      {format(
-                        new Date(sub.nextExecution * 1000),
-                        "MMM d, yyyy",
-                      )}
-                    </TableCell>
-
-                    {/* Actions Dropdown */}
-                    <TableCell className="text-right">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button variant="ghost" className="h-8 w-8 p-0">
-                            <span className="sr-only">Open menu</span>
-                            <MoreHorizontal className="h-4 w-4" />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end">
-                          <DropdownMenuLabel>Actions</DropdownMenuLabel>
-                          <DropdownMenuItem
-                            onClick={() =>
-                              navigator.clipboard.writeText(sub.id)
-                            }
-                          >
-                            Copy ID
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-
-                          {sub.status === "Active" && (
-                            <DropdownMenuItem
-                              onClick={() => handlePause(sub.id)}
-                            >
-                              <Pause className="mr-2 h-4 w-4" /> Pause
-                            </DropdownMenuItem>
-                          )}
-
-                          {sub.status === "Paused" && (
-                            <DropdownMenuItem
-                              onClick={() => handleResume(sub.id)}
-                            >
-                              <Play className="mr-2 h-4 w-4" /> Resume
-                            </DropdownMenuItem>
-                          )}
-
-                          <DropdownMenuItem
-                            onClick={() => handleCancel(sub.id)}
-                            className="text-red-600 focus:text-red-600 focus:bg-red-50"
-                          >
-                            <Trash2 className="mr-2 h-4 w-4" /> Cancel
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </TableCell>
+            </CardContent>
+          </Card>
+        ) : (
+          <Card>
+            <CardHeader>
+              <CardTitle>Outgoing Payments</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Recipient</TableHead>
+                    <TableHead>Amount</TableHead>
+                    <TableHead>Frequency</TableHead>
+                    <TableHead>Next Payment</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead className="text-right">Actions</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          )}
-        </CardContent>
-      </Card>
+                </TableHeader>
+                <TableBody>
+                  {payments.map((payment) => {
+                    const statusInfo = STATUS_LABELS[payment.status] || {
+                      label: "Unknown",
+                      className: "bg-gray-500",
+                    };
+                    const isActive = payment.status === 0;
+                    const isPaused = payment.status === 1;
+                    const isFailed = payment.status === 2;
+                    const isCancelled = payment.status === 3;
+
+                    return (
+                      <TableRow key={payment.id}>
+                        <TableCell className="font-mono text-sm">
+                          {payment.recipient.slice(0, 8)}...
+                          {payment.recipient.slice(-8)}
+                        </TableCell>
+                        <TableCell className="font-semibold">
+                          {payment.amount / 10000000}{" "}
+                          {payment.token || "USDC"}
+                        </TableCell>
+                        <TableCell>{formatInterval(payment.interval)}</TableCell>
+                        <TableCell>
+                          {formatTime(payment.next_execution)}
+                        </TableCell>
+                        <TableCell>
+                          <Badge className={statusInfo.className}>
+                            {statusInfo.label}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="text-right space-x-2">
+                          {isActive && (
+                            <>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => handlePause(payment.id)}
+                                disabled={actionLoading === payment.id}
+                              >
+                                {actionLoading === payment.id
+                                  ? "Pausing..."
+                                  : "Pause"}
+                              </Button>
+                              <Button
+                                variant="destructive"
+                                size="sm"
+                                onClick={() => handleCancel(payment.id)}
+                                disabled={actionLoading === payment.id}
+                              >
+                                Cancel
+                              </Button>
+                            </>
+                          )}
+
+                          {(isPaused || isFailed) && (
+                            <>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => handleResume(payment.id)}
+                                disabled={actionLoading === payment.id}
+                              >
+                                {actionLoading === payment.id
+                                  ? "Resuming..."
+                                  : "Resume"}
+                              </Button>
+                              <Button
+                                variant="destructive"
+                                size="sm"
+                                onClick={() => handleCancel(payment.id)}
+                                disabled={actionLoading === payment.id}
+                              >
+                                Cancel
+                              </Button>
+                            </>
+                          )}
+
+                          {isCancelled && (
+                            <span className="text-gray-500 text-sm">
+                              Cancelled
+                            </span>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        )}
+      </main>
     </div>
-  );
-}
-
-// Helper Component for Status Badges
-function StatusBadge({ status }: { status: SubscriptionStatus }) {
-  const styles = {
-    Active: "bg-emerald-50 text-emerald-700 border-emerald-200",
-    Paused: "bg-amber-50 text-amber-700 border-amber-200",
-    Cancelled: "bg-slate-100 text-slate-700 border-slate-200",
-  };
-
-  const dotStyles = {
-    Active: "bg-emerald-500",
-    Paused: "bg-amber-500",
-    Cancelled: "bg-slate-400",
-  };
-
-  return (
-    <span
-      className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 ${styles[status]}`}
-    >
-      <span
-        className={`mr-1.5 flex h-2 w-2 rounded-full ${dotStyles[status]}`}
-      />
-      {status}
-    </span>
   );
 }

@@ -1,0 +1,827 @@
+================================================================================
+                        RFI FRONTEND MASTER PLAN
+        Minimal, Clean, and Functionality-First Implementation Guide
+================================================================================
+
+PROJECT: RFI (Recurring Finance Infrastructure)
+PURPOSE: Stripe-like recurring payment system on Stellar/Soroban
+FOCUS: Functionality First, Clean Design Second
+STATUS: Hackathon MVP - Phase 1 Priority
+
+================================================================================
+SECTION 1: STRIPE ANALYSIS (Key Patterns to Adopt)
+================================================================================
+
+Based on Stripe's approach to fintech trust-building:
+
+1. CLARITY THROUGH SIMPLICITY
+   - Single Call-to-Action per page (not multiple competing buttons)
+   - Clear hierarchy: Heading → Description → Action
+   - Minimal form fields (only required inputs visible)
+   - Example: Stripe's "Connect Wallet" button is THE focal point
+
+2. STATUS TRANSPARENCY
+   - Real-time status indicators (Active, Paused, Failed, Pending)
+   - Progress indicators showing "which step you're on"
+   - Transaction hash displays (proves on-chain execution)
+   - Payment history with timestamps (builds confidence)
+
+3. TRUST SIGNALS
+   - Wallet address truncation (GABC...XYZ) in top-right
+   - Network indicator ("Stellar Testnet")
+   - Success states with checkmarks + transaction hash
+   - Error states with specific error messages (not generic "Error")
+
+4. CONSISTENT LAYOUT PATTERN
+   - Top navbar: Logo | Nav Links | Wallet Status
+   - Content area: Card-based layout (max-width: 600px)
+   - Footer: Links + Network info
+   - Spacing: 24px gaps (Stripe standard)
+
+5. FORM DESIGN PATTERN (Stripe Billing)
+   - Labels above inputs (not placeholders)
+   - Single column for mobile, auto-layout for desktop
+   - Visual feedback on input focus (border color change)
+   - Submit button disabled until valid (no orphaned errors)
+   - Success state immediately after submit (not delayed)
+
+================================================================================
+SECTION 2: CODEBASE GAP ANALYSIS
+================================================================================
+
+CURRENT STATE (file.txt):
+✓ Has PaymentForm component (creates plans)
+✓ Has PaymentList component (displays plans)
+✓ Has wallet connection logic
+✗ MISSING: Proper status indicators (Active/Paused/Failed)
+✗ MISSING: Transaction hash display in success state
+✗ MISSING: Error handling UI (no error boundary)
+✗ MISSING: Logout/Disconnect button styling
+✗ MISSING: Loading states for async operations
+✗ MISSING: Form validation feedback
+✗ MISSING: Mobile-responsive table (lists not mobile-friendly)
+✗ MISSING: Breadcrumb or page context (where am I?)
+✗ MISSING: Analytics/Stats dashboard (total paid, next payment, etc.)
+
+RFI REQUIREMENTS MAPPING:
+Phase 1 MUST HAVE:
+  ✓ Create Plan form
+  ✓ View Plans list
+  ? Execute Payment (manual trigger for demo)
+  ? Cancel Plan
+  ? Pause/Resume
+
+GAPS TO FILL:
+  1. Payment execution trigger (button on dashboard to execute payment)
+  2. Pause/Resume toggle (not just display)
+  3. Delete/Cancel confirmation modal
+  4. Transaction history view (past payments)
+  5. Statistics dashboard (total paid, next payment date, active plans count)
+
+================================================================================
+SECTION 3: FRONTEND IMPLEMENTATION PLAN
+================================================================================
+
+=== PART A: REUSABLE COMPONENTS (Build These First) ===
+
+Priority Order:
+
+1. PaymentStatusBadge (Reusable)
+   Location: src/components/PaymentStatusBadge.jsx
+   Purpose: Display status (Active, Paused, Cancelled, Pending)
+   Props: status (string: 'active' | 'paused' | 'cancelled' | 'pending')
+   Styling:
+     - Active: Green background (bg-green-50), Green text (text-green-700), Green border
+     - Paused: Yellow background (bg-yellow-50), Yellow text (text-yellow-700)
+     - Cancelled: Gray background (bg-gray-50), Gray text (text-gray-500)
+     - Pending: Blue background (bg-blue-50), Blue text (text-blue-700)
+   Code Pattern:
+     const getStatusStyles = (status) => {
+       const styles = {
+         active: 'bg-green-50 text-green-700 border-green-200',
+         paused: 'bg-yellow-50 text-yellow-700 border-yellow-200',
+         cancelled: 'bg-gray-50 text-gray-500 border-gray-200',
+         pending: 'bg-blue-50 text-blue-700 border-blue-200'
+       };
+       return styles[status];
+     };
+
+2. WalletButton (Reusable)
+   Location: src/components/WalletButton.jsx
+   Purpose: Connect/Disconnect wallet display
+   Props: isConnected (bool), address (string), onConnect (func), onDisconnect (func)
+   Styling:
+     - Connected: Green indicator dot + truncated address (first 4 + last 4 chars)
+     - Disconnected: Gray "Connect Wallet" button
+   Code Pattern:
+     {isConnected ? (
+       <div className="flex items-center gap-2">
+         <div className="w-2 h-2 rounded-full bg-green-500" /> {/* Green dot */}
+         <span className="text-xs font-mono">{address.slice(0,4)}...{address.slice(-4)}</span>
+         <button onClick={onDisconnect}>Disconnect</button>
+       </div>
+     ) : (
+       <button onClick={onConnect}>Connect Wallet</button>
+     )}
+
+3. LoadingSpinner (Reusable)
+   Location: src/components/LoadingSpinner.jsx
+   Purpose: Show loading state during async operations
+   Props: message (string, optional)
+   Styling: Minimal animated spinner + message
+   Note: Keep it simple - just a rotating circle, no fancy animations
+
+4. TransactionHashDisplay (Reusable)
+   Location: src/components/TransactionHashDisplay.jsx
+   Purpose: Show & copy transaction hash after success
+   Props: hash (string), network (string: 'TESTNET' | 'PUBLIC')
+   Styling:
+     - Monospace font
+     - Gray background (bg-slate-100)
+     - "Copy to clipboard" button on right
+     - Link to block explorer (optional for demo)
+   Code Pattern:
+     <div className="flex items-center justify-between bg-slate-100 p-3 rounded">
+       <span className="font-mono text-sm">{hash}</span>
+       <button onClick={() => copyToClipboard(hash)}>Copy</button>
+     </div>
+
+5. ConfirmationModal (Reusable)
+   Location: src/components/ConfirmationModal.jsx
+   Purpose: Confirm destructive actions (Cancel Plan, Pause, etc.)
+   Props: isOpen (bool), title (string), message (string), onConfirm (func), onCancel (func)
+   Styling: Centered dark overlay + white card with two buttons (Cancel, Confirm)
+   Code Pattern:
+     {isOpen && (
+       <div className="fixed inset-0 bg-black/50 flex items-center justify-center">
+         <div className="bg-white p-6 rounded-lg max-w-sm">
+           <h2>{title}</h2>
+           <p>{message}</p>
+           <div className="flex gap-3 mt-6">
+             <button onClick={onCancel}>Cancel</button>
+             <button onClick={onConfirm} className="bg-red-600 text-white">Confirm</button>
+           </div>
+         </div>
+       </div>
+     )}
+
+6. StatCard (Reusable)
+   Location: src/components/StatCard.jsx
+   Purpose: Display dashboard stats (Total Paid, Next Payment, Active Plans)
+   Props: label (string), value (string), subtext (string)
+   Styling: Simple white card with label on top, large number in middle
+   Code Pattern:
+     <div className="bg-white p-6 rounded-lg border border-gray-200">
+       <p className="text-sm text-gray-600">{label}</p>
+       <p className="text-3xl font-bold mt-2">{value}</p>
+       <p className="text-xs text-gray-500 mt-2">{subtext}</p>
+     </div>
+
+7. FormInput (Reusable)
+   Location: src/components/FormInput.jsx
+   Purpose: Standardized input field with label + optional error message
+   Props: label (string), value (string), onChange (func), error (string), placeholder (string)
+   Styling:
+     - Label above input
+     - Red error text below if error prop provided
+     - Focus state: Blue border (border-blue-500)
+     - Normal state: Gray border (border-gray-300)
+
+8. ActionButton (Reusable)
+   Location: src/components/ActionButton.jsx
+   Purpose: Pause/Resume/Cancel/Execute buttons with loading states
+   Props: action (string: 'pause' | 'resume' | 'cancel' | 'execute'), onClick (func), isLoading (bool)
+   Styling:
+     - Execute/Resume: Blue (bg-blue-600)
+     - Pause: Yellow (bg-yellow-500)
+     - Cancel: Red (bg-red-600)
+     - All: Disabled state (opacity-50, cursor-not-allowed) when isLoading=true
+
+=== PART B: PAGE STRUCTURE (Minimal MVP) ===
+
+FLOW: Landing → Auth (Demo) → Dashboard → Create/Edit
+
+1. LANDING PAGE (/)
+   Purpose: Show what RFI is + login button
+   Components: Logo | Tagline | Auth Status | "Connect Wallet" or "View Dashboard" button
+   Simplicity: Hero section only, no complex copy
+   Code Pattern:
+     export default function Landing() {
+       const { user } = useAuth();
+       return (
+         <div className="min-h-screen bg-white flex flex-col items-center justify-center">
+           <h1>RFI</h1>
+           <p>Recurring payments on Stellar</p>
+           {user ? (
+             <Link to="/dashboard"><button>Go to Dashboard</button></Link>
+           ) : (
+             <Link to="/login"><button>Get Started</button></Link>
+           )}
+         </div>
+       );
+     }
+
+2. AUTH PAGE (/login)
+   Purpose: Demo login with name input
+   Components: Input field + Login button
+   Simplicity: Single form, no password
+   Code Pattern: (Already provided in earlier sections)
+
+3. DASHBOARD PAGE (/dashboard)
+   Purpose: View all active plans + quick stats
+   Sections:
+     a) Header: "Your Subscriptions" + "Create New Plan" button
+     b) Stats Row (3 cards):
+        - Total Paid (sum of all payments to date)
+        - Active Plans (count of active agreements)
+        - Next Payment Date (earliest upcoming payment)
+     c) Plans Table:
+        - Columns: Recipient | Amount | Frequency | Next Payment | Status | Actions
+        - Actions per row: Pause | Execute | Cancel
+        - Mobile fallback: Card-based list instead of table
+   Code Pattern:
+     <Dashboard>
+       <header>
+         <h1>Your Subscriptions</h1>
+         <CreateNewPlanButton />
+       </header>
+       <StatsSection>
+         <StatCard label="Total Paid" value="1,250 USDC" subtext="to date" />
+         <StatCard label="Active Plans" value="3" subtext="agreements" />
+         <StatCard label="Next Payment" value="Oct 24, 2025" subtext="in 5 days" />
+       </StatsSection>
+       <PlansTable>
+         {plans.map(plan => (
+           <TableRow key={plan.id}>
+             <Cell>{plan.recipient}</Cell>
+             <Cell>{plan.amount}</Cell>
+             <Cell>{plan.interval}</Cell>
+             <Cell>{plan.nextPayment}</Cell>
+             <Cell><PaymentStatusBadge status={plan.status} /></Cell>
+             <Cell>
+               <ActionButton action="pause" onClick={() => handlePause(plan.id)} />
+               <ActionButton action="execute" onClick={() => handleExecute(plan.id)} />
+               <ActionButton action="cancel" onClick={() => handleCancel(plan.id)} />
+             </Cell>
+           </TableRow>
+         ))}
+       </PlansTable>
+     </Dashboard>
+
+4. CREATE PLAN PAGE (/create)
+   Purpose: Form to set up new recurring payment
+   Sections:
+     a) Form fields:
+        - Recipient Address (input, required)
+        - Amount (number input, required)
+        - Frequency (dropdown: Every Minute, Weekly, Monthly)
+        - Token (dropdown: USDC, test token - for demo, default to USDC)
+        - [Optional] End Date (datepicker)
+     b) Submit button (disabled until recipient + amount filled)
+     c) Help text: "This will set up a recurring payment. You'll be asked to sign with your wallet."
+   Validation:
+     - Recipient: Must be valid Stellar address (starts with G, length 56)
+     - Amount: Must be > 0
+     - Both fields required
+   Success flow: Show TransactionHashDisplay + "Go to Dashboard" link
+
+5. TRANSACTION HISTORY PAGE (/history) [PHASE 2, but nice-to-have]
+   Purpose: View all past payments for each plan
+   Sections:
+     a) Filter by plan (dropdown)
+     b) Table: Date | Amount | Status (Success/Failed) | Hash
+   Note: Optional for MVP, but adds credibility
+
+=== PART C: COLOR PALETTE & TYPOGRAPHY (Stripe-like) ===
+
+COLORS:
+  - Background Primary: #F9FAFB (slate-50)
+  - Background Secondary: #FFFFFF (white)
+  - Border: #E5E7EB (gray-300)
+  - Text Primary: #111827 (gray-900)
+  - Text Secondary: #6B7280 (gray-500)
+  - Action Primary (Blue): #2563EB (blue-600)
+  - Action Hover (Blue): #1D4ED8 (blue-700)
+  - Success (Green): #10B981 (green-600)
+  - Warning (Yellow): #F59E0B (yellow-500)
+  - Error (Red): #EF4444 (red-500)
+  - Status Active: #10B981 (green)
+  - Status Paused: #F59E0B (yellow)
+  - Status Cancelled: #6B7280 (gray)
+  - Status Pending: #3B82F6 (blue)
+
+TYPOGRAPHY:
+  - Font Family: Inter (system font stack: -apple-system, BlinkMacSystemFont, 'Segoe UI')
+  - Heading 1: 28px, 700 weight, letter-spacing -0.5px
+  - Heading 2: 20px, 600 weight
+  - Body: 14px, 400 weight, line-height 1.5
+  - Small: 12px, 400 weight
+  - Monospace (wallet address, hash): 'Courier New' or 'Roboto Mono', 12px
+
+SPACING (Tailwind):
+  - Card padding: 24px (p-6)
+  - Gap between elements: 16px (gap-4)
+  - Gap between sections: 24px (gap-6)
+  - Border radius: 8px (rounded-lg)
+  - Max content width: 600px (single column), 1200px (full dashboard)
+
+================================================================================
+SECTION 4: FUNCTIONALITY CHECKLIST (Phase 1 Must-Have)
+================================================================================
+
+FUNCTION 1: CREATE PLAN
+  Frontend Trigger: Form submit on /create
+  Form Fields Collected:
+    - recipient: string (Stellar address)
+    - amount: number (USDC)
+    - interval: number (seconds: 60, 604800, 2628000)
+    - token: string (contract address)
+  Backend/Smart Contract Call:
+    POST /api/create-plan OR direct contract call
+    Payload: { payer, recipient, amount, token, interval }
+  Success Response:
+    { transactionHash, status: 'success' }
+  UI Flow:
+    1. User fills form
+    2. Click "Start Subscription"
+    3. Show LoadingSpinner ("Processing...")
+    4. Call backend
+    5. On success: Show TransactionHashDisplay + "Go to Dashboard" button
+    6. On error: Show error message in red, allow retry
+  Validation:
+    - recipient length = 56 and starts with 'G'
+    - amount > 0
+    - wallet connected (no wallet = disable submit button)
+
+FUNCTION 2: FETCH PLANS
+  Frontend Trigger: Load /dashboard (useEffect)
+  Backend Call:
+    GET /api/plans?userAddress={walletAddress}
+  Response Shape:
+    [
+      {
+        id: string (contract agreement ID),
+        recipient: string (address),
+        amount: number,
+        token: string,
+        interval: number,
+        nextPayment: ISO datetime string,
+        status: 'active' | 'paused' | 'cancelled',
+        totalPaid: number (optional, for stats),
+        createdAt: ISO datetime string
+      }
+    ]
+  UI Flow:
+    1. Dashboard loads
+    2. Show LoadingSpinner
+    3. Fetch plans
+    4. Render PlansTable OR empty state ("No plans yet")
+    5. Calculate stats (total paid, next payment, count)
+    6. Render StatsSection above table
+
+FUNCTION 3: EXECUTE PAYMENT (Manual Trigger)
+  Frontend Trigger: "Execute" button on dashboard row
+  Backend Call:
+    POST /api/execute-payment
+    Payload: { planId, userAddress }
+  Response:
+    { transactionHash, status: 'success' | 'failed' }
+  UI Flow:
+    1. User clicks "Execute" button
+    2. Show LoadingSpinner over button
+    3. Call backend
+    4. If success: Show small success toast ("Payment executed" + hash) + reload table
+    5. If failed: Show error toast with specific error message
+  Note: For demo, this is manual. In production, backend cron handles it.
+
+FUNCTION 4: PAUSE PLAN
+  Frontend Trigger: "Pause" button (or toggle when status = paused)
+  Backend Call:
+    POST /api/pause-plan
+    Payload: { planId, userAddress }
+  Response:
+    { status: 'paused', nextPayment: null }
+  UI Flow:
+    1. User clicks "Pause" button
+    2. Show LoadingSpinner
+    3. Call backend
+    4. On success: Reload plans, status badge changes to yellow "Paused", button label flips to "Resume"
+    5. On error: Show error toast
+
+FUNCTION 5: RESUME PLAN
+  Frontend Trigger: "Resume" button (when status = paused)
+  Backend Call:
+    POST /api/resume-plan
+    Payload: { planId, userAddress }
+  Response:
+    { status: 'active', nextPayment: ISO datetime }
+  UI Flow: Same as pause, but status reverts to green "Active"
+
+FUNCTION 6: CANCEL PLAN
+  Frontend Trigger: "Cancel" button
+  Confirmation Step:
+    Show ConfirmationModal asking "Are you sure? This cannot be undone."
+  Backend Call (if confirmed):
+    POST /api/cancel-plan
+    Payload: { planId, userAddress }
+  Response:
+    { status: 'cancelled' }
+  UI Flow:
+    1. User clicks "Cancel" button
+    2. Show ConfirmationModal
+    3. If user confirms:
+       a. Show LoadingSpinner
+       b. Call backend
+       c. On success: Row disappears from table OR status becomes gray "Cancelled"
+       d. Reload stats
+    4. If user cancels modal: Modal closes, nothing happens
+
+FUNCTION 7: LOGOUT
+  Frontend Trigger: "Sign Out" button in navbar
+  Action:
+    Clear user state (localStorage, context, etc.)
+    Redirect to /
+  No backend call needed (demo auth)
+
+================================================================================
+SECTION 5: IMPLEMENTATION ROADMAP (Priority Order)
+================================================================================
+
+HOUR 1-2: Setup & Foundation
+  [ ] Create folder structure (components/, pages/, hooks/, utils/)
+  [ ] Set up routing (react-router-dom)
+  [ ] Install dependencies (axios for API calls, tailwindcss)
+  [ ] Create color/spacing constants (design tokens)
+
+HOUR 2-3: Core Components
+  [ ] PaymentStatusBadge
+  [ ] WalletButton
+  [ ] FormInput
+  [ ] ActionButton
+  [ ] StatCard
+  [ ] LoadingSpinner
+  [ ] ConfirmationModal
+  [ ] TransactionHashDisplay
+
+HOUR 3-4: Pages (Basic Structure)
+  [ ] Landing page (/)
+  [ ] Auth page (/login)
+  [ ] Dashboard page skeleton (/dashboard)
+  [ ] Create page skeleton (/create)
+  [ ] Navbar component (shared)
+
+HOUR 4-5: Dashboard Functionality
+  [ ] Wire up fetchPlans() to GET /api/plans
+  [ ] Render PlansTable with mock data
+  [ ] Calculate and display stats
+  [ ] Add error states
+
+HOUR 5-6: Create Plan Functionality
+  [ ] Wire up form validation
+  [ ] Wire up createPlan() to POST /api/create-plan
+  [ ] Show success modal with transaction hash
+  [ ] Handle errors
+
+HOUR 6-7: Plan Actions
+  [ ] Wire up pause button to POST /api/pause-plan
+  [ ] Wire up resume button to POST /api/resume-plan
+  [ ] Wire up execute button to POST /api/execute-payment
+  [ ] Add loading states per button
+
+HOUR 7-8: Cancel & Polish
+  [ ] Wire up cancel button with ConfirmationModal
+  [ ] Add success/error toast notifications
+  [ ] Test mobile responsiveness
+  [ ] Final styling pass
+
+================================================================================
+SECTION 6: ERROR HANDLING STRATEGY (Trust Building)
+================================================================================
+
+ALL API ERRORS SHOULD BE USER-FRIENDLY:
+
+Don't show: "Error 500 Internal Server Error"
+Show: "Transaction failed. Check your connection and try again. If it persists, contact support."
+
+ERROR SCENARIOS:
+1. Wallet not connected
+   Message: "Please connect your wallet to continue."
+   Action: Show ConnectWalletButton
+
+2. Insufficient balance
+   Message: "You don't have enough USDC to create this plan. Minimum required: [amount]"
+   Action: Show amount needed
+
+3. Invalid recipient address
+   Message: "Recipient address is not valid. Must be a Stellar address starting with 'G'."
+   Action: Focus recipient input field
+
+4. Transaction timeout
+   Message: "Transaction took too long. It may still have processed. Check your transaction hash in your wallet."
+   Action: Show "Try Again" button
+
+5. Network error
+   Message: "Unable to connect to the network. Please check your internet connection."
+   Action: Show "Retry" button
+
+================================================================================
+SECTION 7: MOBILE RESPONSIVENESS (Simple Approach)
+================================================================================
+
+BREAKPOINTS:
+- Mobile: < 640px
+- Tablet: 640px - 1024px
+- Desktop: > 1024px
+
+ADJUSTMENTS:
+1. Navbar: Stack vertically on mobile (hamburger menu optional for MVP)
+2. PlansTable: Convert to card-based list on mobile
+   - Each plan = one white card with stack layout
+   - Actions move below amount (don't overflow)
+3. StatsSection: Single column on mobile, 3 columns on desktop
+4. Forms: Full width on all screens, consistent padding
+5. Modals: 90vw width on mobile, max-w-sm on desktop
+
+TAILWIND UTILITIES:
+  - hidden md:block (hide on mobile)
+  - flex flex-col md:flex-row (stack on mobile, row on desktop)
+  - w-full md:w-1/3 (full width on mobile, 1/3 on desktop)
+  - p-4 md:p-6 (smaller padding on mobile)
+
+================================================================================
+SECTION 8: TESTING CHECKLIST (Before Demo)
+================================================================================
+
+FUNCTIONALITY:
+  [ ] Create plan with all fields filled
+  [ ] Create plan with missing fields (should show error)
+  [ ] Invalid wallet address (should show error)
+  [ ] Execute payment (manual trigger)
+  [ ] Pause plan (status changes to yellow)
+  [ ] Resume plan (status changes to green)
+  [ ] Cancel plan (show confirmation modal, then disappear from list)
+  [ ] Logout and back to home
+  [ ] Reconnect wallet
+
+VISUAL:
+  [ ] All badge colors render correctly
+  [ ] Form validation error text is visible
+  [ ] LoadingSpinner appears during async calls
+  [ ] TransactionHashDisplay is readable
+  [ ] ConfirmationModal is centered and visible
+  [ ] Mobile view stacks correctly
+
+EDGE CASES:
+  [ ] No plans exist (show "No active plans" message)
+  [ ] Very long wallet address (truncate correctly)
+  [ ] Very long recipient address (handle in form)
+  [ ] Rapid button clicks (don't send multiple requests)
+  [ ] Network timeout (show error, allow retry)
+
+================================================================================
+SECTION 9: DEPLOYMENT CHECKLIST (Before Hackathon Submission)
+================================================================================
+
+CODE QUALITY:
+  [ ] No console.log() left in code (use proper logging if needed)
+  [ ] All imports are used (no dead code)
+  [ ] Component names follow PascalCase
+  [ ] File names follow kebab-case
+  [ ] No TypeScript errors (if using TS)
+
+PERFORMANCE:
+  [ ] No unnecessary re-renders (use React.memo if needed)
+  [ ] Images optimized (if using any)
+  [ ] No inline styles (use className + Tailwind)
+
+SECURITY:
+  [ ] No sensitive data in environment variables (use .env.local)
+  [ ] Wallet addresses validated before use
+  [ ] No hardcoded contract addresses (use env vars)
+
+ACCESSIBILITY:
+  [ ] All buttons have text labels (not just icons)
+  [ ] Form inputs have associated labels
+  [ ] Color not sole indicator of status (use text + icon if possible)
+  [ ] Keyboard navigation works (Tab through form)
+
+DOCUMENTATION:
+  [ ] README.md explains how to run locally
+  [ ] .env.local.example file provided (with dummy values)
+  [ ] Comments on complex functions
+  [ ] Git commit messages are clear
+
+================================================================================
+SECTION 10: QUICK REFERENCE CODE SNIPPETS
+================================================================================
+
+SNIPPET 1: Basic Form Pattern
+```jsx
+const [formData, setFormData] = useState({ recipient: '', amount: '' });
+const [errors, setErrors] = useState({});
+
+const handleChange = (e) => {
+  setFormData({ ...formData, [e.target.name]: e.target.value });
+};
+
+const validateForm = () => {
+  const newErrors = {};
+  if (!formData.recipient) newErrors.recipient = 'Recipient is required';
+  if (formData.amount <= 0) newErrors.amount = 'Amount must be greater than 0';
+  return newErrors;
+};
+
+const handleSubmit = async (e) => {
+  e.preventDefault();
+  const newErrors = validateForm();
+  if (Object.keys(newErrors).length > 0) {
+    setErrors(newErrors);
+    return;
+  }
+  // Call API
+};
+
+return (
+  <form onSubmit={handleSubmit}>
+    <FormInput 
+      label="Recipient" 
+      name="recipient" 
+      value={formData.recipient}
+      onChange={handleChange}
+      error={errors.recipient}
+    />
+    <FormInput 
+      label="Amount" 
+      name="amount" 
+      type="number"
+      value={formData.amount}
+      onChange={handleChange}
+      error={errors.amount}
+    />
+    <button type="submit">Submit</button>
+  </form>
+);
+```
+
+SNIPPET 2: API Call with Loading & Error
+```jsx
+const [loading, setLoading] = useState(false);
+const [error, setError] = useState(null);
+
+const fetchPlans = async () => {
+  setLoading(true);
+  setError(null);
+  try {
+    const response = await fetch(`/api/plans?userAddress=${walletAddress}`);
+    if (!response.ok) throw new Error('Failed to fetch plans');
+    const data = await response.json();
+    setPlans(data);
+  } catch (err) {
+    setError(err.message);
+  } finally {
+    setLoading(false);
+  }
+};
+
+useEffect(() => {
+  if (walletAddress) fetchPlans();
+}, [walletAddress]);
+
+return (
+  <div>
+    {loading && <LoadingSpinner />}
+    {error && <div className="text-red-600">{error}</div>}
+    {!loading && plans.length > 0 && <PlansTable plans={plans} />}
+    {!loading && plans.length === 0 && <p>No plans found</p>}
+  </div>
+);
+```
+
+SNIPPET 3: Toast Notification (Simple)
+```jsx
+const [toast, setToast] = useState(null);
+
+const showToast = (message, type = 'success') => {
+  setToast({ message, type });
+  setTimeout(() => setToast(null), 3000); // Auto-dismiss after 3s
+};
+
+return (
+  <div>
+    {toast && (
+      <div className={`fixed bottom-4 right-4 p-4 rounded ${
+        toast.type === 'success' ? 'bg-green-500' : 'bg-red-500'
+      } text-white`}>
+        {toast.message}
+      </div>
+    )}
+  </div>
+);
+```
+
+================================================================================
+END OF RFI FRONTEND MASTER PLAN
+================================================================================
+
+NEXT STEPS:
+1. Review this plan with your team (especially backend)
+2. Adjust component names/structure if needed
+3. Begin implementation from Section 5 roadmap
+4. Share API contracts (request/response shapes) between frontend/backend teams
+5. Daily standup on blockers (usually API integration issues)
+
+GOOD LUCK WITH THE HACKATHON! 🚀
+
+
+
+
+
+# 4️⃣ FRONTEND – What it MUST contain
+
+Think like Stripe Dashboard.
+
+---
+
+## 🧩 Required Pages
+
+### 1️⃣ Landing Page
+
+* What this product is
+* “Create Subscription”
+* “Connect Wallet”
+
+---
+
+### 2️⃣ Wallet Connect
+
+* Freighter / Albedo
+* Show balance
+* Show allowance status
+
+---
+
+### 3️⃣ Create Subscription Page
+
+User selects:
+
+* Recipient
+* Token
+* Amount
+* Interval (seconds / days / monthly)
+* AutoPay / Prepaid
+* Charge start (Immediate / Delayed)
+
+➡️ Calls backend → backend calls contract
+
+---
+
+### 4️⃣ Subscriptions Dashboard (MOST IMPORTANT)
+
+Table:
+
+* Payment ID
+* Amount
+* Interval
+* Next execution
+* Status
+* Actions
+
+Actions:
+
+* Pause
+* Resume
+* Cancel
+
+---
+
+### 5️⃣ Subscription Detail Page
+
+Shows:
+
+* Execution history
+* Retry count
+* Prepaid balance
+* Next execution timestamp
+* Status timeline
+
+---
+
+### 6️⃣ Executor Status Page (Admin)
+
+* Last run
+* Success rate
+* Failed txs
+* Contract paused or not
+
+
+## ✅ Frontend Checklist
+
+* [ ] Wallet connect
+* [ ] Subscription creation
+* [ ] Allowance check UI
+* [ ] Subscription dashboard
+* [ ] Pause / resume / cancel
+* [ ] Execution history
+* [ ] Error messages (mapped properly)
+* [ ] Human-readable intervals
+* [ ] Admin executor stats

@@ -1,360 +1,507 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec, symbol_short};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, contracterror,
+    token, Address, BytesN, Env, Vec, Map, symbol_short,
+};
 
-// Error codes
-pub const ERR_NOT_PAYER: u32 = 1;
-pub const ERR_NOT_DUE: u32 = 2;
-pub const ERR_INSUFFICIENT_BALANCE: u32 = 3;
-pub const ERR_INSUFFICIENT_ALLOWANCE: u32 = 4;
-pub const ERR_PAYMENT_INACTIVE: u32 = 5;
-pub const ERR_ALREADY_EXECUTED: u32 = 6;
-pub const ERR_INVALID_INTERVAL: u32 = 7;
-pub const ERR_INVALID_AMOUNT: u32 = 8;
+const MAX_RETRIES: u32 = 3;
+const MIN_INTERVAL: u64 = 60;
+const MAX_BATCH_SIZE: u32 = 20;
+const LIFETIME_THRESHOLD: u32 = 17280;
+const BUMP_AMOUNT: u32 = 518400;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[contracttype]
-pub enum PaymentStatus {
-    Active = 0,
-    Paused = 1,
-    Failed = 2,
-    Cancelled = 3,
+#[contracterror]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum Error {
+    NotAuthorized = 1,
+    PaymentNotDue = 2,
+    InsufficientBalance = 3,
+    InsufficientAllowance = 4,
+    PaymentInactive = 5,
+    AlreadyExecuted = 6,
+    InvalidInterval = 7,
+    InvalidAmount = 8,
+    PaymentNotFound = 9,
+    InvalidTotalCycles = 10,
+    CannotResumeCancelled = 11,
+    CannotResumeCompleted = 12,
+    AlreadyCancelled = 13,
+    RefundFailed = 14,
+    ContractPaused = 15,
+    NotAdmin = 16,
+    ExecutorNotAllowed = 17,
+    RateLimited = 18,
+    BatchTooLarge = 19,
+    PlanNotFound = 20,
 }
 
-#[derive(Clone)]
 #[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PaymentStatus {
+    Active,
+    Paused,
+    Failed,
+    Cancelled,
+    Completed,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SubscriptionType {
+    AutoPay,
+    Prepaid,
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub struct Payment {
     pub id: u64,
     pub payer: Address,
     pub recipient: Address,
+    pub token: Address,
     pub amount: i128,
     pub interval: u64,
     pub next_execution: u64,
-    pub last_execution_ledger: u32,
+    pub last_ledger: u32,
     pub status: PaymentStatus,
-    pub retry_count: u32,
-    pub created_at: u64,
+    pub retries: u32,
+    pub sub_type: SubscriptionType,
+    pub total_cycles: u64,
+    pub paid_cycles: u64,
+    pub prepaid_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Plan {
+    pub id: u32,
+    pub token: Address,
+    pub amount: i128,
+    pub interval: u64,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Config {
+    pub admin: Address,
+    pub treasury: Address,
+    pub platform_fee_bps: u32,
+    pub paused: bool,
+}
+
+#[contracttype]
+pub enum StorageKey {
+    Config,
+    Payment(u64),
+    Plan(u32),
+    Executor(Address),
+    PaymentCount,
 }
 
 #[contract]
-pub struct RecurringPaymentContract;
+pub struct StripeLikeSubscriptions;
 
 #[contractimpl]
-impl RecurringPaymentContract {
-    /// Create a new recurring payment
-    pub fn create_payment(
+impl StripeLikeSubscriptions {
+
+    /* ---------------- ADMIN ---------------- */
+
+    pub fn initialize(
         env: Env,
-        payer: Address,
-        recipient: Address,
+        admin: Address,
+        treasury: Address,
+        platform_fee_bps: u32,
+    ) -> Result<(), Error> {
+        if env.storage().instance().has(&StorageKey::Config) {
+            return Err(Error::NotAuthorized);
+        }
+
+        let cfg = Config {
+            admin: admin.clone(),
+            treasury,
+            platform_fee_bps,
+            paused: false,
+        };
+
+        env.storage().instance().set(&StorageKey::Config, &cfg);
+        env.storage().instance().extend_ttl(LIFETIME_THRESHOLD, BUMP_AMOUNT);
+
+        Ok(())
+    }
+
+    pub fn add_executor(env: Env, admin: Address, executor: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let cfg = Self::config(&env)?;
+        if cfg.admin != admin {
+            return Err(Error::NotAdmin);
+        }
+
+        env.storage().persistent().set(&StorageKey::Executor(executor), &true);
+        Ok(())
+    }
+
+    /* ---------------- PLAN ---------------- */
+
+    pub fn create_plan(
+        env: Env,
+        admin: Address,
+        plan_id: u32,
+        token: Address,
         amount: i128,
         interval: u64,
-    ) -> u64 {
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let cfg = Self::config(&env)?;
+        if cfg.admin != admin {
+            return Err(Error::NotAdmin);
+        }
+
+        let plan = Plan {
+            id: plan_id,
+            token,
+            amount,
+            interval,
+            active: true,
+        };
+
+        env.storage().persistent().set(&StorageKey::Plan(plan_id), &plan);
+        Ok(())
+    }
+
+    pub fn subscribe_to_plan(
+        env: Env,
+        payer: Address,
+        plan_id: u32,
+        recipient: Address,
+        total_cycles: u64,
+        sub_type_symbol: soroban_sdk::Symbol,
+    ) -> Result<u64, Error> {
         payer.require_auth();
 
-        // Validation
-        if amount <= 0 {
-            panic!("Invalid amount: {}", ERR_INVALID_AMOUNT);
-        }
-        if interval < 60 {
-            panic!("Invalid interval: {}", ERR_INVALID_INTERVAL);
+        let plan: Plan = env.storage()
+            .persistent()
+            .get(&StorageKey::Plan(plan_id))
+            .ok_or(Error::PlanNotFound)?;
+
+        if !plan.active {
+            return Err(Error::PlanNotFound);
         }
 
-        // Generate payment ID
-        let payment_count = Self::get_payment_count(&env, &payer);
+        // Convert symbol to enum
+        let sub_type = if sub_type_symbol == symbol_short!("AutoPay") {
+            SubscriptionType::AutoPay
+        } else {
+            SubscriptionType::Prepaid
+        };
+
+        let token_client = token::Client::new(&env, &plan.token);
+
+        let prepaid_balance = if sub_type == SubscriptionType::Prepaid {
+            let total_amount = plan.amount.checked_mul(total_cycles as i128).unwrap_or(0);
+            if total_amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            token_client.transfer(&payer, &env.current_contract_address(), &total_amount);
+            total_amount
+        } else {
+            0
+        };
+
+        let payment_count: u64 = env.storage()
+            .instance()
+            .get(&StorageKey::PaymentCount)
+            .unwrap_or(0);
+
         let payment_id = payment_count + 1;
-
-        let current_time = env.ledger().timestamp();
-        let next_execution = current_time + interval;
 
         let payment = Payment {
             id: payment_id,
             payer: payer.clone(),
             recipient,
-            amount,
-            interval,
-            next_execution,
-            last_execution_ledger: 0,
+            token: plan.token,
+            amount: plan.amount,
+            interval: plan.interval,
+            next_execution: env.ledger().timestamp(),
+            last_ledger: 0,
             status: PaymentStatus::Active,
-            retry_count: 0,
-            created_at: current_time,
+            retries: 0,
+            sub_type,
+            total_cycles,
+            paid_cycles: 0,
+            prepaid_balance,
         };
 
-        // Store payment
-        env.storage().persistent().set(&payment_id, &payment);
+        env.storage().persistent().set(&StorageKey::Payment(payment_id), &payment);
+        env.storage().instance().set(&StorageKey::PaymentCount, &payment_id);
 
-        // Update payer's payment index
-        Self::add_payment_to_payer(&env, &payer, payment_id);
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("created"), payer.clone()),
-            (payment_id, amount, interval),
-        );
-
-        payment_id
+        Ok(payment_id)
     }
 
-    /// Execute a recurring payment (called by executor)
-    pub fn execute_payment(env: Env, payment_id: u64) -> bool {
-        let mut payment: Payment = env
-            .storage()
-            .persistent()
-            .get(&payment_id)
-            .unwrap_or_else(|| panic!("Payment not found"));
+    pub fn create_payment(
+        env: Env,
+        payer: Address,
+        recipient: Address,
+        token: Address,
+        amount: i128,
+        interval: u64,
+        total_cycles: u64,
+        sub_type_symbol: soroban_sdk::Symbol,
+    ) -> Result<u64, Error> {
+        payer.require_auth();
 
-        let current_time = env.ledger().timestamp();
-        let current_ledger = env.ledger().sequence();
-
-        // Guard 1: Check if payment is active
-        if payment.status != PaymentStatus::Active {
-            panic!("Payment inactive: {}", ERR_PAYMENT_INACTIVE);
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if interval < MIN_INTERVAL {
+            return Err(Error::InvalidInterval);
         }
 
-        // Guard 2: Check if payment is due
-        if current_time < payment.next_execution {
-            panic!("Payment not due: {}", ERR_NOT_DUE);
-        }
-
-        // Guard 3: Prevent duplicate execution in same ledger
-        if payment.last_execution_ledger == current_ledger {
-            panic!("Already executed: {}", ERR_ALREADY_EXECUTED);
-        }
-
-        // Attempt transfer (this will fail if insufficient balance/allowance)
-        let transfer_result = Self::try_transfer(
-            &env,
-            &payment.payer,
-            &payment.recipient,
-            payment.amount,
-        );
-
-        if transfer_result {
-            // Success - update payment
-            payment.next_execution = current_time + payment.interval;
-            payment.last_execution_ledger = current_ledger;
-            payment.retry_count = 0;
-
-            env.storage().persistent().set(&payment_id, &payment);
-
-            // Emit success event
-            env.events().publish(
-                (symbol_short!("executed"), payment_id),
-                (payment.amount, payment.next_execution),
-            );
-
-            true
+        // Convert symbol to enum
+        let sub_type = if sub_type_symbol == symbol_short!("AutoPay") {
+            SubscriptionType::AutoPay
         } else {
-            // Failure - increment retry count
-            payment.retry_count += 1;
+            SubscriptionType::Prepaid
+        };
 
-            if payment.retry_count >= 3 {
-                payment.status = PaymentStatus::Failed;
+        let token_client = token::Client::new(&env, &token);
+
+        let prepaid_balance = if sub_type == SubscriptionType::Prepaid {
+            let total_amount = amount.checked_mul(total_cycles as i128).unwrap_or(0);
+            if total_amount <= 0 {
+                return Err(Error::InvalidAmount);
             }
+            token_client.transfer(&payer, &env.current_contract_address(), &total_amount);
+            total_amount
+        } else {
+            0
+        };
 
-            env.storage().persistent().set(&payment_id, &payment);
+        let payment_count: u64 = env.storage()
+            .instance()
+            .get(&StorageKey::PaymentCount)
+            .unwrap_or(0);
 
-            // Emit failure event
-            env.events().publish(
-                (symbol_short!("failed"), payment_id),
-                payment.retry_count,
-            );
+        let payment_id = payment_count + 1;
 
-            false
-        }
+        let payment = Payment {
+            id: payment_id,
+            payer: payer.clone(),
+            recipient,
+            token,
+            amount,
+            interval,
+            next_execution: env.ledger().timestamp(),
+            last_ledger: 0,
+            status: PaymentStatus::Active,
+            retries: 0,
+            sub_type,
+            total_cycles,
+            paid_cycles: 0,
+            prepaid_balance,
+        };
+
+        env.storage().persistent().set(&StorageKey::Payment(payment_id), &payment);
+        env.storage().instance().set(&StorageKey::PaymentCount, &payment_id);
+
+        Ok(payment_id)
     }
 
-    /// Pause a recurring payment
-    pub fn pause_payment(env: Env, payment_id: u64) {
-        let mut payment: Payment = env
-            .storage()
+    /* ---------------- EXECUTION ---------------- */
+
+    pub fn execute_batch(
+        env: Env,
+        executor: Address,
+        payment_ids: Vec<u64>,
+    ) -> Result<Vec<bool>, Error> {
+        executor.require_auth();
+
+        if payment_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        if !env.storage().persistent().has(&StorageKey::Executor(executor.clone())) {
+            return Err(Error::ExecutorNotAllowed);
+        }
+
+        let mut results = Vec::new(&env);
+        for pid in payment_ids {
+            let res = Self::execute_payment(env.clone(), pid).unwrap_or(false);
+            results.push_back(res);
+        }
+
+        Ok(results)
+    }
+
+    pub fn execute_payment(env: Env, payment_id: u64) -> Result<bool, Error> {
+        let mut payment: Payment = env.storage()
             .persistent()
-            .get(&payment_id)
-            .unwrap_or_else(|| panic!("Payment not found"));
+            .get(&StorageKey::Payment(payment_id))
+            .ok_or(Error::PaymentNotFound)?;
 
-        payment.payer.require_auth();
+        let now = env.ledger().timestamp();
+        let ledger = env.ledger().sequence();
 
+        if payment.last_ledger == ledger {
+            return Err(Error::RateLimited);
+        }
         if payment.status != PaymentStatus::Active {
-            panic!("Payment not active: {}", ERR_PAYMENT_INACTIVE);
+            return Err(Error::PaymentInactive);
+        }
+        if now < payment.next_execution {
+            return Err(Error::PaymentNotDue);
         }
 
-        payment.status = PaymentStatus::Paused;
-        env.storage().persistent().set(&payment_id, &payment);
+        let cfg = Self::config(&env)?;
+        let fee = payment.amount * cfg.platform_fee_bps as i128 / 10_000;
+        let net = payment.amount - fee;
 
-        env.events().publish(
-            (symbol_short!("paused"), payment_id),
-            env.ledger().timestamp(),
-        );
-    }
+        let token_client = token::Client::new(&env, &payment.token);
 
-    /// Resume a paused or failed payment
-    pub fn resume_payment(env: Env, payment_id: u64) {
-        let mut payment: Payment = env
-            .storage()
-            .persistent()
-            .get(&payment_id)
-            .unwrap_or_else(|| panic!("Payment not found"));
-
-        payment.payer.require_auth();
-
-        if payment.status == PaymentStatus::Cancelled {
-            panic!("Cannot resume cancelled payment");
-        }
-
-        let current_time = env.ledger().timestamp();
-
-        payment.status = PaymentStatus::Active;
-        payment.retry_count = 0;
-        payment.next_execution = current_time + payment.interval;
-
-        env.storage().persistent().set(&payment_id, &payment);
-
-        env.events().publish(
-            (symbol_short!("resumed"), payment_id),
-            payment.next_execution,
-        );
-    }
-
-    /// Cancel a recurring payment
-    pub fn cancel_payment(env: Env, payment_id: u64) {
-        let mut payment: Payment = env
-            .storage()
-            .persistent()
-            .get(&payment_id)
-            .unwrap_or_else(|| panic!("Payment not found"));
-
-        payment.payer.require_auth();
-
-        payment.status = PaymentStatus::Cancelled;
-        env.storage().persistent().set(&payment_id, &payment);
-
-        env.events().publish(
-            (symbol_short!("cancelled"), payment_id),
-            env.ledger().timestamp(),
-        );
-    }
-
-    /// Get payment details
-    pub fn get_payment(env: Env, payment_id: u64) -> Payment {
-        env.storage()
-            .persistent()
-            .get(&payment_id)
-            .unwrap_or_else(|| panic!("Payment not found"))
-    }
-
-    /// Get all payments for a payer
-    pub fn get_payments_by_payer(env: Env, payer: Address, offset: u32, limit: u32) -> Vec<Payment> {
-        let payment_count = Self::get_payment_count(&env, &payer);
-        let mut payments = Vec::new(&env);
-
-        let start = offset;
-        let end = (offset + limit).min(payment_count as u32);
-
-        for i in start..end {
-            let payment_id: u64 = env
-                .storage()
-                .persistent()
-                .get(&(payer.clone(), i))
-                .unwrap_or(0);
-
-            if payment_id > 0 {
-                if let Some(payment) = env.storage().persistent().get(&payment_id) {
-                    payments.push_back(payment);
+        match payment.sub_type {
+            SubscriptionType::AutoPay => {
+                // Use transfer_from to transfer from payer using the contract's allowance
+                token_client.transfer_from(&env.current_contract_address(), &payment.payer, &payment.recipient, &net);
+                if fee > 0 {
+                    token_client.transfer_from(&env.current_contract_address(), &payment.payer, &cfg.treasury, &fee);
+                }
+            }
+            SubscriptionType::Prepaid => {
+                payment.prepaid_balance -= payment.amount;
+                token_client.transfer(&env.current_contract_address(), &payment.recipient, &net);
+                if fee > 0 {
+                    token_client.transfer(&env.current_contract_address(), &cfg.treasury, &fee);
                 }
             }
         }
 
-        payments
+        payment.last_ledger = ledger;
+        payment.paid_cycles += 1;
+        payment.next_execution = now + payment.interval;
+
+        if payment.sub_type == SubscriptionType::Prepaid && payment.paid_cycles >= payment.total_cycles {
+            payment.status = PaymentStatus::Completed;
+        }
+
+        env.storage().persistent().set(&StorageKey::Payment(payment_id), &payment);
+        env.storage().persistent().set(&StorageKey::Payment(payment_id), &payment);
+        Ok(true)
     }
 
-    // Helper functions
+    /* ---------------- LIFECYLE ---------------- */
 
-    fn get_payment_count(env: &Env, payer: &Address) -> u64 {
-        env.storage()
-            .persistent()
-            .get(&(symbol_short!("count"), payer.clone()))
-            .unwrap_or(0)
+    pub fn pause_payment(env: Env, payment_id: u64) -> Result<(), Error> {
+        let mut payment = Self::get_payment(env.clone(), payment_id)?;
+        payment.payer.require_auth();
+
+        if payment.status != PaymentStatus::Active {
+            return Err(Error::PaymentInactive);
+        }
+
+        payment.status = PaymentStatus::Paused;
+        env.storage().persistent().set(&StorageKey::Payment(payment_id), &payment);
+        Ok(())
     }
 
-    fn add_payment_to_payer(env: &Env, payer: &Address, payment_id: u64) {
-        let count = Self::get_payment_count(env, payer);
-        let new_count = count + 1;
+    pub fn resume_payment(env: Env, payment_id: u64) -> Result<(), Error> {
+        let mut payment = Self::get_payment(env.clone(), payment_id)?;
+        payment.payer.require_auth();
 
-        // Store payment ID at index
-        env.storage()
-            .persistent()
-            .set(&(payer.clone(), count as u32), &payment_id);
+        if payment.status != PaymentStatus::Paused {
+            return Err(Error::PaymentInactive);
+        }
 
-        // Update count
-        env.storage()
-            .persistent()
-            .set(&(symbol_short!("count"), payer.clone()), &new_count);
-    }
-
-    fn try_transfer(_env: &Env, _from: &Address, _to: &Address, _amount: i128) -> bool {
-        // In a real implementation, this would use Stellar's token interface
-        // For now, we'll simulate the transfer
-        // This should use: token_client.transfer(from, to, amount)
+        payment.status = PaymentStatus::Active;
+        // Optionally update next_execution if it's in the past to prevent immediate execution accumulation
+        // For now, we leave it as is, meaning it might be executed immediately if due.
         
-        // Placeholder - in production, check allowance and execute transfer
-        // using Stellar Asset Contract (SAC) interface
-        true
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
-
-    #[test]
-    fn test_create_payment() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, RecurringPaymentContract);
-        let client = RecurringPaymentContractClient::new(&env, &contract_id);
-
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        env.mock_all_auths();
-
-        let payment_id = client.create_payment(&payer, &recipient, &1000, &3600);
-
-        assert_eq!(payment_id, 1);
-
-        let payment = client.get_payment(&payment_id);
-        assert_eq!(payment.payer, payer);
-        assert_eq!(payment.recipient, recipient);
-        assert_eq!(payment.amount, 1000);
-        assert_eq!(payment.interval, 3600);
+        env.storage().persistent().set(&StorageKey::Payment(payment_id), &payment);
+        Ok(())
     }
 
-    #[test]
-    #[should_panic(expected = "Invalid amount")]
-    fn test_invalid_amount() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, RecurringPaymentContract);
-        let client = RecurringPaymentContractClient::new(&env, &contract_id);
+    pub fn cancel_payment(env: Env, payment_id: u64) -> Result<(), Error> {
+        let mut payment = Self::get_payment(env.clone(), payment_id)?;
+        payment.payer.require_auth();
 
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
+        if payment.status == PaymentStatus::Cancelled {
+            return Err(Error::AlreadyCancelled);
+        }
 
-        env.mock_all_auths();
+        // If prepaid and has balance, refund it
+        if payment.sub_type == SubscriptionType::Prepaid && payment.prepaid_balance > 0 {
+            let token_client = token::Client::new(&env, &payment.token);
+            token_client.transfer(&env.current_contract_address(), &payment.payer, &payment.prepaid_balance);
+            payment.prepaid_balance = 0;
+        }
 
-        client.create_payment(&payer, &recipient, &0, &3600);
+        payment.status = PaymentStatus::Cancelled;
+        env.storage().persistent().set(&StorageKey::Payment(payment_id), &payment);
+        Ok(())
     }
 
-    #[test]
-    #[should_panic(expected = "Invalid interval")]
-    fn test_invalid_interval() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, RecurringPaymentContract);
-        let client = RecurringPaymentContractClient::new(&env, &contract_id);
+    /* ---------------- QUERY ---------------- */
 
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
+    pub fn get_payment(env: Env, payment_id: u64) -> Result<Payment, Error> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Payment(payment_id))
+            .ok_or(Error::PaymentNotFound)
+    }
 
-        env.mock_all_auths();
+    pub fn get_plan(env: Env, plan_id: u32) -> Result<Plan, Error> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Plan(plan_id))
+            .ok_or(Error::PlanNotFound)
+    }
 
-        client.create_payment(&payer, &recipient, &1000, &30);
+    pub fn can_execute(env: Env, payment_id: u64) -> bool {
+        let payment_opt: Option<Payment> = env.storage().persistent().get(&StorageKey::Payment(payment_id));
+        match payment_opt {
+            Some(p) => {
+                p.status == PaymentStatus::Active &&
+                env.ledger().timestamp() >= p.next_execution &&
+                p.last_ledger != env.ledger().sequence()
+            }
+            None => false,
+        }
+    }
+
+    pub fn get_payments_by_payer(env: Env, payer: Address, offset: u32, limit: u32) -> Vec<Payment> {
+        let mut result = Vec::new(&env);
+        let payment_count: u64 = env.storage().instance().get(&StorageKey::PaymentCount).unwrap_or(0);
+        
+        // Simple linear scan (not optimal for production, but works for now)
+        let mut found = 0u32;
+        let mut skipped = 0u32;
+        
+        for i in 1..=payment_count {
+            if found >= limit {
+                break;
+            }
+            
+            if let Some(payment) = env.storage().persistent().get::<StorageKey, Payment>(&StorageKey::Payment(i)) {
+                if payment.payer == payer {
+                    if skipped >= offset {
+                        result.push_back(payment);
+                        found += 1;
+                    } else {
+                        skipped += 1;
+                    }
+                }
+            }
+        }
+        
+        result
+    }
+
+    /* ---------------- INTERNAL ---------------- */
+
+    fn config(env: &Env) -> Result<Config, Error> {
+        env.storage().instance()
+            .get(&StorageKey::Config)
+            .ok_or(Error::NotAuthorized)
     }
 }

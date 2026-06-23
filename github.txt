@@ -1,0 +1,10 @@
+#PULL
+git pull origin main
+
+
+#CODE 
+
+#PUSH
+git add .
+git commit -m "Describe what you fixed"
+git push origin main
